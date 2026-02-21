@@ -24,6 +24,12 @@ Thumbs.db
 
 # Logs
 *.log
+logs/
+
+# News scraper database and exports
+news_scraper/news.db
+news_scraper/*.db
+news_export_*.csv
 
 # Testing
 .pytest_cache/
