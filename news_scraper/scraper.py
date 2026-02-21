@@ -2,13 +2,16 @@
 News scraper CLI for Indonesian equity research.
 
 Usage:
-    python -m news_scraper.scraper run          # scrape all sources
-    python -m news_scraper.scraper run --source kontan
-    python -m news_scraper.scraper query        # show recent flagged articles
-    python -m news_scraper.scraper query --sector Perbankan
-    python -m news_scraper.scraper query --keyword akuisisi --days 14
-    python -m news_scraper.scraper stats        # show DB statistics
-    python -m news_scraper.scraper export       # export flagged articles to CSV
+    python -m news_scraper run                   # scrape all sources
+    python -m news_scraper run --push-sheets     # scrape + push to Google Sheets
+    python -m news_scraper run --source kontan
+    python -m news_scraper query --flagged
+    python -m news_scraper query --sector Perbankan
+    python -m news_scraper query --keyword akuisisi --days 14
+    python -m news_scraper push                  # push DB articles to Google Sheets
+    python -m news_scraper push --all            # push all articles (not just flagged)
+    python -m news_scraper stats
+    python -m news_scraper export
 """
 
 import argparse
@@ -37,6 +40,34 @@ SCRAPER_MAP = {s.source_id: s for s in ALL_SCRAPERS}
 
 
 # ---------------------------------------------------------------------------
+# Shared helper
+# ---------------------------------------------------------------------------
+
+def _push_to_sheets(articles: list[dict], push_all: bool = False, sheet_id: str = ""):
+    """Push articles to Google Sheets. Prints result summary."""
+    from news_scraper.notifiers.sheets import SheetsNotifier
+    try:
+        notifier = SheetsNotifier(sheet_id=sheet_id or None)
+        if push_all:
+            counts = notifier.push_all(articles)
+            print(
+                f"\nGoogle Sheets — Flagged tab: {counts['flagged_pushed']} new rows "
+                f"(skipped {counts['flagged_skipped']})\n"
+                f"               All tab:     {counts['all_pushed']} new rows "
+                f"(skipped {counts['all_skipped']})"
+            )
+        else:
+            pushed, skipped = notifier.push(articles, tab_name="Flagged", flagged_only=True)
+            print(
+                f"\nGoogle Sheets — Flagged tab: {pushed} new rows pushed "
+                f"(skipped {skipped} duplicates)."
+            )
+    except Exception as exc:
+        logger.error("Google Sheets push failed: %s", exc)
+        print(f"\n[ERROR] Sheets push failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -54,6 +85,7 @@ def cmd_run(args):
 
     total_new = 0
     total_flagged = 0
+    new_articles: list[dict] = []   # collect for optional Sheets push
 
     for ScraperClass in sources_to_run:
         scraper = ScraperClass(
@@ -75,17 +107,10 @@ def cmd_run(args):
         flagged_count = 0
 
         for art in articles:
-            # Combine title + summary for classification
             text = f"{art.title} {art.summary or ''}"
-
-            # Keyword filtering
             matched = find_keywords(text)
             is_flagged = len(matched) > 0
-
-            # Sector classification
             sector = classify_sector(art.title, art.summary or "")
-
-            # Ticker extraction
             ticker = extract_ticker(art.title, art.summary or "")
 
             is_new, _aid = upsert_article(
@@ -102,6 +127,20 @@ def cmd_run(args):
 
             if is_new:
                 new_count += 1
+                article_dict = {
+                    "source": art.source,
+                    "title": art.title,
+                    "url": art.url,
+                    "summary": art.summary,
+                    "published_at": art.published_at,
+                    "scraped_at": datetime.now().isoformat(),
+                    "keywords_matched": json.dumps(matched),
+                    "sector": sector,
+                    "ticker": ticker,
+                    "is_flagged": 1 if is_flagged else 0,
+                }
+                new_articles.append(article_dict)
+
                 if is_flagged:
                     flagged_count += 1
                     kw_str = ", ".join(matched)
@@ -132,6 +171,15 @@ def cmd_run(args):
         f"\nSummary: {total_new} new articles stored, "
         f"{total_flagged} flagged for corporate action keywords."
     )
+
+    # Optional: push new articles to Google Sheets immediately after scraping
+    if getattr(args, "push_sheets", False) and new_articles:
+        print("\nPushing to Google Sheets...")
+        _push_to_sheets(
+            new_articles,
+            push_all=getattr(args, "push_all", False),
+            sheet_id=getattr(args, "sheet_id", "") or "",
+        )
 
 
 def cmd_query(args):
@@ -215,9 +263,45 @@ def cmd_export(args):
     print(f"Exported {len(rows)} articles to {out_path}")
 
 
+def cmd_push(args):
+    """Push articles from the DB to Google Sheets."""
+    init_db()
+    rows = query_articles(
+        sector=getattr(args, "sector", None),
+        source=getattr(args, "source", None),
+        keyword=getattr(args, "keyword", None),
+        flagged_only=not args.all,
+        days=args.days,
+        limit=args.limit,
+    )
+    if not rows:
+        print("No articles to push.")
+        return
+
+    print(f"Pushing {len(rows)} articles to Google Sheets...")
+    _push_to_sheets(
+        rows,
+        push_all=args.all,
+        sheet_id=args.sheet_id or "",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
+
+def _add_sheets_args(p, include_all: bool = True):
+    """Shared Sheets-related arguments."""
+    p.add_argument(
+        "--sheet-id", dest="sheet_id", default="",
+        help="Google Spreadsheet ID (overrides GOOGLE_SHEET_ID env var)",
+    )
+    if include_all:
+        p.add_argument(
+            "--all", action="store_true",
+            help="Push all articles (not just flagged ones)",
+        )
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -235,6 +319,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument(
         "--max-articles", type=int, default=50, dest="max_articles",
         help="Max articles per source per run",
+    )
+    p_run.add_argument(
+        "--push-sheets", action="store_true", dest="push_sheets",
+        help="Push new flagged articles to Google Sheets after scraping",
+    )
+    p_run.add_argument(
+        "--push-all", action="store_true", dest="push_all",
+        help="When --push-sheets is set, push all articles (not just flagged)",
+    )
+    p_run.add_argument(
+        "--sheet-id", dest="sheet_id", default="",
+        help="Google Spreadsheet ID (overrides GOOGLE_SHEET_ID env var)",
     )
 
     # -- query --
@@ -260,6 +356,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_ex.add_argument("--days", type=int, default=30, help="Look back N days (default 30)")
     p_ex.add_argument("--limit", type=int, default=1000, help="Max results (default 1000)")
 
+    # -- push --
+    p_push = sub.add_parser("push", help="Push articles from DB to Google Sheets")
+    p_push.add_argument("--sector", help="Filter by sector")
+    p_push.add_argument("--source", help="Filter by source")
+    p_push.add_argument("--keyword", help="Filter by keyword")
+    p_push.add_argument("--all", action="store_true", help="Push all articles, not just flagged")
+    p_push.add_argument("--days", type=int, default=7, help="Look back N days (default 7)")
+    p_push.add_argument("--limit", type=int, default=1000, help="Max rows to push (default 1000)")
+    _add_sheets_args(p_push, include_all=False)
+
     return parser
 
 
@@ -271,6 +377,7 @@ def main():
         "query": cmd_query,
         "stats": cmd_stats,
         "export": cmd_export,
+        "push": cmd_push,
     }[args.command](args)
 
 
